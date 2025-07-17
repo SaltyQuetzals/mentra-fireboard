@@ -25,7 +25,8 @@ export default defineConfig({
         target: 'http://localhost:3000',
         changeOrigin: true
       }
-    }
+    },
+    allowedHosts: ["jawfish-uncommon-yeti.ngrok-free.app"]
   },
   resolve: {
     alias: {
