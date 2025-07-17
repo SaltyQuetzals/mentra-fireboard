@@ -1,70 +1,73 @@
-import React from 'react';
+import React, { FormEventHandler, useState } from 'react';
 import { useMentraAuth } from '@mentra/react';
-import TranscriptDisplay from './components/TranscriptDisplay';
+import LoadingScreen from './components/LoadingScreen';
+import ErrorScreen from './components/ErrorScreen';
+import NotAuthenticatedScreen from './components/NotAuthenticatedScreen';
+import FireboardAuthForm from './components/FireboardAuthForm';
+import FireboardAuthenticatedScreen from './components/FireboardAuthenticatedScreen';
 
-/**
- * Main App component that manages authentication state and renders
- * the appropriate content based on authentication status
- */
 function App(): React.JSX.Element {
   const { userId, isLoading, error, isAuthenticated } = useMentraAuth();
+  const [isFireboardAuthenticated, setIsFireboardAuthenticated] = useState(false);
 
-  // Handle loading state
-  if (isLoading) {
-    return (
-      <div className="min-h-screen flex flex-col bg-gray-100">
-        <div className="flex flex-col items-center justify-center min-h-screen gap-4">
-          <div className="w-10 h-10 border-3 border-gray-300 border-t-mentraos-blue rounded-full animate-spin"></div>
-          <p className="text-gray-600">Loading authentication...</p>
-        </div>
-      </div>
-    );
-  }
+  React.useEffect(() => {
+    // Check if user is authenticated with Fireboard
+    fetch('/api/login', {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          setIsFireboardAuthenticated(false);
+          return;
+        }
+        const data = await response.json();
+        setIsFireboardAuthenticated(!!data?.authenticated);
+      })
+      .catch(() => {
+        setIsFireboardAuthenticated(false);
+      });
+  }, []);
 
-  // Handle error state
-  if (error) {
-    return (
-      <div className="min-h-screen flex flex-col bg-gray-100">
-        <div className="flex flex-col items-center justify-center min-h-screen text-center p-8">
-          <h2 className="text-red-600 text-2xl font-semibold mb-4">Authentication Error</h2>
-          <p className="text-red-600 font-medium mb-2">{error}</p>
-          <p className="text-gray-600 text-sm">
-            Please ensure you are opening this page from the MentraOS app.
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const handleFireboardAuthSubmit: FormEventHandler<HTMLFormElement> = (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    const username = formData.get('username');
+    const password = formData.get('password');
 
-  // Handle unauthenticated state
-  if (!isAuthenticated || !userId) {
-    return (
-      <div className="min-h-screen flex flex-col bg-gray-100">
-        <div className="flex flex-col items-center justify-center min-h-screen text-center p-8">
-          <h2 className="text-red-600 text-2xl font-semibold mb-4">Not Authenticated</h2>
-          <p className="text-gray-700">Please open this page from the MentraOS manager app to view live transcripts.</p>
-        </div>
-      </div>
-    );
-  }
+    fetch('/api/login/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        username,
+        password
+      })
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          const errorBody = await response.json();
+          throw new Error(
+            errorBody?.error?.detail ||
+            errorBody?.error ||
+            JSON.stringify(errorBody)
+          );
+        }
+        setIsFireboardAuthenticated(true);
+      })
+      .catch((err) => {
+        alert(err.message || err);
+      });
+  };
 
-  // Authenticated - show transcript display
-  return (
-    <div className="min-h-screen flex flex-col bg-gray-100">
-      <header className="bg-blue text-white px-8 py-6 shadow-md">
-        <h1 className="text-3xl font-semibold mb-2">MentraOS Live Transcripts</h1>
-        <div className="text-sm opacity-90">
-          <span className="mr-2">User ID:</span>
-          <span className="font-mono bg-white bg-opacity-10 px-2 py-0.5 rounded">
-            {userId}
-          </span>
-        </div>
-      </header>
-      <main className="flex-1 p-8 max-w-6xl mx-auto w-full">
-        <TranscriptDisplay />
-      </main>
-    </div>
-  );
+  if (isLoading) return <LoadingScreen />;
+  if (error) return <ErrorScreen error={error} />;
+  if (!isAuthenticated || !userId) return <NotAuthenticatedScreen />;
+  if (!isFireboardAuthenticated) return <FireboardAuthForm onSubmit={handleFireboardAuthSubmit} />;
+  return <FireboardAuthenticatedScreen />;
 }
 
 export default App;

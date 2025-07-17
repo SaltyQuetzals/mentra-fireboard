@@ -1,28 +1,27 @@
 import { AppServer, AppSession, AuthenticatedRequest } from '@mentra/sdk';
 import express from 'express';
 import path from 'path';
+import { retrieveAuthenticationToken } from './fireboard/api';
+import { FireboardClient } from './fireboard/fireboard_client';
+import { Device } from './fireboard/api_types';
+import { readFile } from 'fs/promises';
+import EventEmitter from 'events';
 
 // Load configuration from environment variables
 const PACKAGE_NAME = process.env.PACKAGE_NAME ?? (() => { throw new Error('PACKAGE_NAME is not set in .env file'); })();
 const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY ?? (() => { throw new Error('MENTRAOS_API_KEY is not set in .env file'); })();
 const PORT = parseInt(process.env.PORT || '3000');
 
-/**
- * Interface for transcript data
- */
-interface TranscriptData {
-  text: string;
-  timestamp: number;
-  isFinal: boolean;
-}
+class FireboardMentraOSApp extends AppServer {
+  /**
+   * Keys = MentraOS User IDs
+   * Values = Fireboard API Keys
+   */
+  private apiKeyCache: Map<string, string> = new Map();
 
-/**
- * ExampleReactApp - MentraOS app that demonstrates React frontend integration
- * with live transcript updates using Server-Sent Events
- */
-class ExampleReactApp extends AppServer {
-  /** Map to store active SSE connections by userId */
-  private sseConnections = new Map<string, express.Response[]>();
+  private appSessions: Map<string, { fireboard: FireboardClient, timer: NodeJS.Timeout, session: AppSession }>;
+
+  private emitter: EventEmitter;
 
   constructor() {
     super({
@@ -32,6 +31,14 @@ class ExampleReactApp extends AppServer {
     });
 
     this.setupRoutes();
+    this.emitter = new EventEmitter();
+    this.appSessions = new Map();
+    this.emitter.addListener('temp_update', this.handleTempUpdate);
+    this.addCleanupHandler(this.onCleanup);
+  }
+
+  private onCleanup() {
+    this.emitter.removeListener('temp_update', this.handleTempUpdate);
   }
 
   /**
@@ -45,10 +52,12 @@ class ExampleReactApp extends AppServer {
       app.use(express.static(path.join(__dirname, '../dist/frontend')));
     }
 
-            // SSE endpoint for live transcript updates
-    // Note: For simplicity in this example, we're using a middleware approach
-    // In production, you'd want to verify the token from the query parameter
-    app.get('/api/transcripts', (req: AuthenticatedRequest, res) => {
+    // Health check endpoint
+    app.get('/api/health', (req, res) => {
+      res.json({ status: 'ok', timestamp: Date.now() });
+    });
+
+    app.get('/api/login', (req: AuthenticatedRequest, res) => {
       const userId = req.authUserId;
 
       if (!userId) {
@@ -56,66 +65,29 @@ class ExampleReactApp extends AppServer {
         return;
       }
 
-      // Set up SSE headers
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-      });
+      res.json({ authenticated: this.apiKeyCache.has(userId) })
+    })
 
-      // Store the connection
-      if (!this.sseConnections.has(userId)) {
-        this.sseConnections.set(userId, []);
+    app.post('/api/login', (req: AuthenticatedRequest, res) => {
+      const userId = req.authUserId;
+
+      if (!userId) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
       }
-      this.sseConnections.get(userId)!.push(res);
 
-      // Send initial connection message
-      res.write(`data: ${JSON.stringify({ type: 'connected', userId })}\n\n`);
-
-      // Clean up on disconnect
-      req.on('close', () => {
-        const connections = this.sseConnections.get(userId);
-        if (connections) {
-          const index = connections.indexOf(res);
-          if (index > -1) {
-            connections.splice(index, 1);
-          }
-          if (connections.length === 0) {
-            this.sseConnections.delete(userId);
-          }
-        }
+      retrieveAuthenticationToken(req.body.username, req.body.password).then((apiToken) => {
+        this.apiKeyCache.set(userId, apiToken);
+        res.sendStatus(200);
+      }).catch((err) => {
+        res.status(400).json({ error: err });
       });
-    });
-
-    // Health check endpoint
-    app.get('/api/health', (req, res) => {
-      res.json({ status: 'ok', timestamp: Date.now() });
-    });
+    })
 
     // Catch-all route for React app (in production)
     if (process.env.NODE_ENV === 'production') {
       app.get('*', (req, res) => {
         res.sendFile(path.join(__dirname, '../dist/frontend/index.html'));
-      });
-    }
-  }
-
-  /**
-   * Send transcript update to all SSE connections for a user
-   * @param userId - The user ID to send updates to
-   * @param transcript - The transcript data to send
-   */
-  private sendTranscriptUpdate(userId: string, transcript: TranscriptData): void {
-    const connections = this.sseConnections.get(userId);
-    if (connections) {
-      const data = JSON.stringify({
-        type: 'transcript',
-        ...transcript
-      });
-
-      connections.forEach(res => {
-        res.write(`data: ${data}\n\n`);
       });
     }
   }
@@ -129,41 +101,135 @@ class ExampleReactApp extends AppServer {
   protected async onSession(session: AppSession, sessionId: string, userId: string): Promise<void> {
     console.log(`New session: ${sessionId} for user ${userId}`);
 
-    // Show welcome message
-    session.layouts.showTextWall("React Example App - Open the webview to see live transcripts!");
+    if (!this.apiKeyCache.has(userId)) {
+      session.layouts.showTextWall("You must authenticate with Fireboard before you can use this app. Please log in via the webview, and then restart this app.")
+      return;
+    }
 
-    // Listen for transcriptions and relay them to the frontend
-    const transcriptionHandler = session.events.onTranscription((data) => {
-      // Send both interim and final transcriptions
-      this.sendTranscriptUpdate(userId, {
-        text: data.text,
-        timestamp: Date.now(),
-        isFinal: data.isFinal
-      });
-
-      // Also show final transcriptions on the glasses
-      if (data.isFinal) {
-        session.layouts.showTextWall(`You said: ${data.text}`);
-      }
-    });
-
-    // Clean up handlers when session ends
-    this.addCleanupHandler(transcriptionHandler);
+    const fireboard = new FireboardClient({ token: this.apiKeyCache.get(userId)! });
+    await fireboard.authenticate();
+    session.layouts.showTextWall('Fetching active Fireboard devices...');
+    const devices = await fireboard.listAllDevices();
+    const timer = await this.#pollActiveDevicesDummy(sessionId, fireboard, []);
+    this.appSessions.set(sessionId, { fireboard, timer, session })
 
     // Handle session disconnect
     session.events.onDisconnected(() => {
-      console.log(`Session ${sessionId} disconnected.`);
-      // Close any SSE connections for this user
-      const connections = this.sseConnections.get(userId);
-      if (connections) {
-        connections.forEach(res => res.end());
-        this.sseConnections.delete(userId);
-      }
+      const session = this.appSessions.get(sessionId);
+      clearInterval(session?.timer);
+      this.appSessions.delete(sessionId);
     });
+  }
+
+  private handleTempUpdate = (data: { mentraSessionId: string, payload: { label: string, temp: number }[] }) => {
+    const mentraSession = this.appSessions.get(data.mentraSessionId);
+    if (mentraSession === undefined) {
+      console.warn(`Attempted to lookup ${data.mentraSessionId} in app sessions, but no session was found. Uncleared interval?`);
+      return;
+    }
+    const displayString = this.constructDisplayString(data.payload)
+    mentraSession.session.layouts.showTextWall(displayString);
+  }
+
+
+  private constructDisplayString = (payload: { label: string, temp: number }[]): string => {
+    // Display the label as keys and the temp as values in a columnar format
+    // Example:
+    // Pit: 225.0°F
+    // Probe 2: 180.2°F
+    // etc.
+    if (!payload || payload.length === 0) {
+      return "No temperature data available.";
+    }
+    // Format each line as "Label: temp°F" (rounded to 1 decimal)
+    return payload
+      .map(({ label, temp }) => {
+        // If temp is undefined or null, show as "--"
+        const tempStr = (typeof temp === "number" && !isNaN(temp)) ? `${temp.toFixed(1)}°F` : "--";
+        return `${label}: ${tempStr}`;
+      })
+      .join('\n');
+  }
+
+
+  // async #listActiveDevices(fireboard: FireboardClient) {
+  //   const devices = await fireboard.listAllDevices();
+  //   return devices.filter((device) => device.latest_temps && device.latest_temps.length > 0);
+  // }
+
+  // #pollActiveDevices = async (fireboard: FireboardClient, devices: Device[]) =>
+  //   setInterval(() => {
+  //     const promises = devices.map((device) => fireboard.retrieveRealtimeTemperatureOfDevice(device.uuid));
+  //     try {
+  //       Promise.allSettled(promises).then((results) => {
+  //         for (const result of results) {
+  //           if (result.status === 'rejected') {
+  //             continue;
+  //           }
+  //           console.log(result.value);
+  //         }
+  //       })
+  //     }
+  //     catch (err) {
+  //       console.log(err);
+  //     }
+  //   });
+
+  #pollActiveDevicesDummy = async (mentraSessionId: string, fireboard: FireboardClient, devices: Device[]) => {
+    type DummyChannel = {
+      label: string;
+      x: number[];
+      device: string;
+      degreetype: number;
+      color: string;
+      channel_id: number;
+      y: number[];
+      enabled: boolean;
+    };
+
+    /**
+     * Performs a binary search to find the largest index in a sorted array of numbers
+     * whose value is less than or equal to the provided value.
+     * Returns -1 if all elements are greater than the value.
+     */
+    function binarySearchLE(arr: number[], value: number): number {
+      let left = 0;
+      let right = arr.length - 1;
+      let result = -1;
+      while (left <= right) {
+        const mid = Math.floor((left + right) / 2);
+        if (arr[mid] <= value) {
+          result = mid;
+          left = mid + 1;
+        } else {
+          right = mid - 1;
+        }
+      }
+      return result;
+    }
+
+    const file = await readFile('session_9366593.json', { encoding: 'utf-8' });
+    const channelsFromFile: DummyChannel[] = JSON.parse(file);
+    const minX = Math.min(...channelsFromFile.map((channel) => channel.x[0]));
+
+    const channels: DummyChannel[] = channelsFromFile.map((channel) => ({
+      ...channel,
+      x: channel.x.map((x) => (x - minX) + Date.now())
+    }))
+
+
+    return setInterval(() => {
+      const payload = channels.map((channel) => {
+        const index = binarySearchLE(channel.x, Date.now());
+        return { label: channel.label, temp: channel.y[index] };
+      });
+
+      this.emitter.emit('temp_update', { mentraSessionId, payload })
+    }, 5_000)
   }
 }
 
 // Start the server
-const app = new ExampleReactApp();
+const app = new FireboardMentraOSApp();
 
 app.start().catch(console.error);
